@@ -1,0 +1,268 @@
+---
+title: "Lab2_Final_2"
+author: "Luke Profio"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Setup
+
+## Load libraries
+
+```{r message=FALSE, warning=FALSE}
+library(ranger)
+library(tidyverse)
+library(tidymodels)
+library(DataExplorer)
+library(forcats)
+library(conflicted)
+library(vip)
+conflicted::conflicts_prefer(yardstick::spec)
+```
+
+## Read CSV
+
+```{r p2 load_data}
+df <- read_csv("scholastic_travel.csv", show_col_types = FALSE) |>
+  mutate(across(where(is.character), as.factor))
+```
+
+
+## Set global variables to be used throughout the analysis
+
+
+```{r p3}
+custom_metrics <- metric_set(accuracy, sens, spec, precision, recall)
+set.seed(42)
+```
+
+
+# Data Exploration
+
+## Missing values
+
+```{r p4}
+plot_intro(df)
+```
+## Retention by Categorical Variables
+
+```{r p5}
+plot_bar(df, by = "RetainedLabel")
+```
+
+## Retention by Categorical Variables (Zoomed In)
+
+```{r p6}
+df_proportions <- df |>
+  group_by(SPRNewExisting, RetainedLabel) |>
+  summarise(Count = n()) |> 
+  mutate(Proportion = Count / sum(Count)) |>
+  ungroup() 
+
+ggplot(df_proportions, aes(x = Proportion, y = SPRNewExisting, fill = RetainedLabel)) +
+  geom_bar(stat = "identity", position = "fill", orientation = "y") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "Proportion", y = "Program Code", fill = "Status") +
+  ggtitle("Proportion of Churned vs Retained by SPRNewExisting") +
+  theme_minimal()
+```
+
+```{r p7}
+df_proportions
+```
+
+## Retention by Numeric Variables 
+
+```{r p8}
+ggplot(df, aes(x = RetainedLabel, y = FPP, fill = RetainedLabel)) +
+  geom_boxplot() +
+  labs(title = "Side by Side Boxplots", x = "Customer Retained Label", y = "Number of Full Paying Participants (FPP)") +
+  theme_minimal()
+```
+
+```{r p9}
+df |>
+  group_by(RetainedLabel) |>
+  summarise(count=n(), across(where(is.numeric), mean))
+```
+
+# Data Modeling
+
+## Split Data for Training and Testing
+
+```{r p10}
+split <- initial_split(df, 
+                       prop = 0.80, 
+                       strata = RetainedLabel) 
+
+train <- training(split)
+test <- testing(split)
+```
+
+## K-Nearest Neighbor
+
+```{r p11}
+library(kknn)
+library(caret)
+
+knn_recipe <- 
+  recipe(RetainedLabel ~ FromGrade + IsNonAnnual + Tuition + ToGrade + TotalSchoolEnrollment + FPP + SchoolSponsor + TotalPax + SingleGradeTripFlag, data = train) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal(), -all_outcomes())
+
+knn_model <- 
+  nearest_neighbor(weight_func = "cos", neighbors = 20, dist_power = 2) |>
+  set_engine("kknn") |>
+  set_mode("classification")
+
+knn_workflow <- 
+  workflow() |> 
+  add_model(knn_model) |> 
+  add_recipe(knn_recipe) |>
+  fit(data = train)
+```
+
+
+## Evaluate the Model
+
+```{r p12}
+pred_class <- predict(knn_workflow,
+                      new_data = test,
+                      type = "class")
+
+pred_probability <- predict(knn_workflow,
+                      new_data = test,
+                      type = "prob")
+
+knn_results <- test |>
+  bind_cols(pred_class, pred_probability)
+
+custom_metrics(knn_results,
+               truth = RetainedLabel,
+               estimate = .pred_class)
+```
+
+### Confusion Matrix
+
+```{r p13}
+conf_mat(knn_results, truth = RetainedLabel,
+         estimate = .pred_class)
+```
+
+### ROC Area Under the Curve
+
+```{r p14}
+roc_auc(knn_results,
+        truth = RetainedLabel,
+        .pred_Retained,
+        event_level = "second")
+```
+
+### ROC Curve Visual
+
+```{r p15}
+knn_results |>
+  roc_curve(truth = RetainedLabel, .pred_Retained, event_level = "second") |>
+  autoplot()
+```
+
+## Random Forest
+
+```{r p16}
+cv_set <- vfold_cv(train, strata = RetainedLabel, v = 5)
+
+rf_recipe <- 
+  recipe(RetainedLabel ~ SPRNewExisting + FromGrade + InitialSystemDate + FRPActive + LatestRPL + FromGrade + FPPtoSchoolenrollment + SPRGroupRevenue + FRPTakeuppercent + DepartureDate + FPPtoPAX + DifferenceTraveltoFirstMeeting + DepositDate + ReturnDate + IsNonAnnual + Tuition + ToGrade + TotalSchoolEnrollment + FPP + SchoolSponsor + TotalPax + SingleGradeTripFlag, data = train) 
+
+rf_model <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = tune()) |> 
+  set_engine("ranger") |> 
+  set_mode("classification")
+
+rf_workflow <- 
+  workflow() |> 
+  add_model(rf_model) |> 
+  add_recipe(rf_recipe)
+
+rf_res <- 
+  rf_workflow |> 
+  tune_grid(cv_set,
+            grid = 25,
+            control = control_grid(),
+            metrics = metric_set(accuracy)) 
+
+rf_res |>
+  show_best(metric = "accuracy")
+```
+
+### Use the best parameters from the Random Forest model tuning to train the model
+
+```{r p17}
+rf_model <- 
+  rand_forest(mtry = 3, min_n = 32, trees = 1093 ) |> 
+  set_engine("ranger", importance = 'impurity') |> 
+  set_mode("classification")
+
+fit_workflow <- 
+  workflow() |> 
+  add_model(rf_model) |> 
+  add_recipe(rf_recipe) |> 
+  fit(data = train)
+
+
+pred_class <- predict(fit_workflow,
+                      new_data = test,
+                      type = "class")
+
+pred_probability <- predict(fit_workflow,
+                      new_data = test,
+                      type = "prob")
+
+rf_results <- test |>
+  bind_cols(pred_class, pred_probability)
+
+
+custom_metrics(rf_results,
+               truth = RetainedLabel,
+               estimate = .pred_class)
+```
+### ROC Area Under the Curve
+
+```{r p18}
+roc_auc(rf_results,
+        truth = RetainedLabel,
+        .pred_Retained,
+        event_level = "second")
+```
+### ROC Curve Visual
+
+```{r p19}
+rf_results |>
+  roc_curve(truth = RetainedLabel, .pred_Retained, event_level = "second") |>
+  autoplot()
+```
+### Variable Importance Plot
+
+```{r p20}
+fit_workflow |>
+  extract_fit_parsnip() |> 
+  vip(num_features = 20)
+```
+
+```{r p21}
+model_data <- read_csv("scholastic_travel_predictions.csv", show_col_types = FALSE)
+```
+
+
+```{r p22}
+pred_class <- predict(fit_workflow,
+                      new_data = model_data,
+                      type = "class")
+
+model_data <- model_data |>
+  mutate(RetainedLabel = pred_class$.pred_class)
+
+write_csv(model_data, "model_data.csv")
+```
